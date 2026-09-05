@@ -18,7 +18,7 @@ from flask import Flask, request
 
 # ============================================================
 # KINO YASA BOT
-# 1/8-QISM — ASOSIY SOZLAMALAR
+# 1/8-QISM — ASOSIY SOZLAMALAR / SUPABASE + 3D
 # ============================================================
 
 
@@ -29,6 +29,15 @@ from flask import Flask, request
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "5923596931"))
+
+# Supabase server-side API. Telefon bu ma'lumotlarni ko'rmaydi.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
+
+# 3D procedural cinematic engine. Og'ir Blender/model paketlari telefonga o'rnatilmaydi.
+MOVIE_3D_ENABLED = os.environ.get("MOVIE_3D_ENABLED", "1").lower() not in ("0", "false", "no")
+MOVIE_3D_DEPTH = max(1, int(os.environ.get("MOVIE_3D_DEPTH", "6")))
 
 # AI API key
 
@@ -94,16 +103,200 @@ def load_json_data():
     return default
 
 
+def _sb_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _sb_request(method, table, payload=None, params=None, timeout=20, prefer=None):
+    if not SUPABASE_ENABLED:
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    headers = _sb_headers()
+    if prefer:
+        headers["Prefer"] = prefer
+    r = requests.request(method, url, headers=headers, json=payload, params=params, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Supabase {table} HTTP {r.status_code}: {r.text[:800]}")
+    if not r.text.strip():
+        return []
+    try:
+        return r.json()
+    except Exception:
+        return []
+
+
+SB_USER_IDS = {}
+SB_SALES_SYNCED = set()
+SB_WITHDRAWALS_SYNCED = set()
+
+
+def _load_from_supabase():
+    """Supabase mavjud bo'lsa, JSON formatidagi eski xotira tuzilmasiga moslab yuklaydi."""
+    global users, referral_map, sales_rows, withdrawals, month_reward, kinolar
+    try:
+        urows = _sb_request("GET", "users", params={"select":"*"}) or []
+        users = {}
+        SB_USER_IDS.clear()
+        for row in urows:
+            tg = str(row.get("telegram_id"))
+            SB_USER_IDS[tg] = row.get("id")
+            item = {
+                "user_id": safe_int(row.get("telegram_id")),
+                "full_name": row.get("full_name") or "Foydalanuvchi",
+                "username": row.get("username"),
+                "balance": safe_int(row.get("balance")),
+                "rating_ball": safe_int(row.get("rating_ball")),
+                "monthly_rating_ball": safe_int(row.get("monthly_rating_ball")),
+                "referrals": safe_int(row.get("referrals")),
+                "referral_bonus": safe_int(row.get("referral_bonus")),
+                "total_movies": safe_int(row.get("total_movies")),
+                "total_sales": safe_int(row.get("total_sales")),
+                "movie_rights": safe_int(row.get("movie_rights")),
+                "premium_until": row.get("premium_until"),
+            }
+            item["level"] = level_from_ball(item.get("rating_ball")) if "level_from_ball" in globals() else "🌱 Yangi hamkor"
+            users[tg] = item
+
+        referral_map = {}
+        refs = _sb_request("GET", "referrals", params={"select":"user_id,referrer_id"}) or []
+        uuid_to_tg = {str(v): k for k, v in SB_USER_IDS.items()}
+        for row in refs:
+            child = uuid_to_tg.get(str(row.get("user_id")))
+            parent = uuid_to_tg.get(str(row.get("referrer_id")))
+            if child and parent:
+                referral_map[child] = parent
+
+        sales_rows = []
+        sales = _sb_request("GET", "sales", params={"select":"id,user_id,movie_code,amount,created_at"}) or []
+        for row in sales:
+            tg = uuid_to_tg.get(str(row.get("user_id")))
+            if tg:
+                item = {"id": row.get("id"), "user_id": safe_int(tg), "movie_code": str(row.get("movie_code", "")), "amount": safe_int(row.get("amount")), "created_at": row.get("created_at") or datetime.now().isoformat()}
+                sales_rows.append(item)
+                if row.get("id"):
+                    SB_SALES_SYNCED.add(str(row.get("id")))
+
+        withdrawals = []
+        wr = _sb_request("GET", "withdrawals", params={"select":"id,user_id,amount,card,status,created_at,approved_at,rejected_at"}) or []
+        for row in wr:
+            tg = uuid_to_tg.get(str(row.get("user_id")))
+            if tg:
+                item = {"id": str(row.get("id")), "user_id": safe_int(tg), "amount": safe_int(row.get("amount")), "card": row.get("card", ""), "status": row.get("status", "pending"), "created_at": row.get("created_at") or datetime.now().isoformat(), "approved_at": row.get("approved_at"), "rejected_at": row.get("rejected_at")}
+                withdrawals.append(item)
+                SB_WITHDRAWALS_SYNCED.add(str(row.get("id")))
+
+        month_reward = {}
+        mr = _sb_request("GET", "month_rewards", params={"select":"month_key,last_processed,current_month","order":"updated_at.desc","limit":"1"}) or []
+        if mr:
+            month_reward = {"last_processed": mr[0].get("last_processed"), "current_month": mr[0].get("current_month")}
+        settings = _sb_request("GET", "settings", params={"select":"value","key":"eq.month_state","limit":"1"}) or []
+        if settings and isinstance(settings[0].get("value"), dict):
+            DATA["month"] = settings[0]["value"]
+
+        movies = _sb_request("GET", "movies", params={"select":"code,name,year,size,genre,telegram_file_id,video_type"}) or []
+        kinolar = {}
+        for row in movies:
+            code = str(row.get("code"))
+            kinolar[code] = {"nom": row.get("name", "Nomsiz"), "yil": row.get("year"), "hajm": row.get("size"), "janr": row.get("genre"), "video": row.get("telegram_file_id"), "video_type": row.get("video_type") or "video"}
+        print(f"☁️ Supabase: ulandi | users={len(users)} sales={len(sales_rows)} withdrawals={len(withdrawals)} movies={len(kinolar)}", flush=True)
+        return True
+    except Exception as e:
+        print("⚠️ Supabase yuklash xatosi, lokal JSON fallback:", type(e).__name__, e, flush=True)
+        return False
+
+
+def _sb_sync_users():
+    for uid, user in list(users.items()):
+        uid = str(uid)
+        payload = {
+            "telegram_id": safe_int(uid), "full_name": user.get("full_name") or "Foydalanuvchi", "username": user.get("username"),
+            "balance": safe_int(user.get("balance")), "rating_ball": safe_int(user.get("rating_ball")),
+            "monthly_rating_ball": safe_int(user.get("monthly_rating_ball")), "referrals": safe_int(user.get("referrals")),
+            "referral_bonus": safe_int(user.get("referral_bonus")), "total_movies": safe_int(user.get("total_movies")),
+            "total_sales": safe_int(user.get("total_sales")), "movie_rights": safe_int(user.get("movie_rights")), "premium_until": user.get("premium_until"),
+        }
+        rows = _sb_request("POST", "users", payload, params={"on_conflict":"telegram_id"}, prefer="resolution=merge-duplicates,return=representation") or []
+        if rows and rows[0].get("id"):
+            SB_USER_IDS[uid] = rows[0]["id"]
+
+
+def _sb_sync_referrals():
+    if not referral_map:
+        return
+    for child, parent in referral_map.items():
+        child_id = SB_USER_IDS.get(str(child)); parent_id = SB_USER_IDS.get(str(parent))
+        if child_id and parent_id:
+            _sb_request("POST", "referrals", {"user_id": child_id, "referrer_id": parent_id}, params={"on_conflict":"user_id"}, prefer="resolution=merge-duplicates,return=minimal")
+
+
+def _sb_sync_new_sales():
+    for row in list(sales_rows):
+        sid = str(row.get("id", ""))
+        if sid and sid in SB_SALES_SYNCED:
+            continue
+        uid = str(row.get("user_id")); db_uid = SB_USER_IDS.get(uid)
+        if not db_uid:
+            continue
+        payload = {"user_id": db_uid, "movie_code": str(row.get("movie_code", "")), "amount": safe_int(row.get("amount"))}
+        try:
+            out = _sb_request("POST", "sales", payload, prefer="return=representation") or []
+            if out and out[0].get("id"):
+                row["id"] = str(out[0]["id"]); SB_SALES_SYNCED.add(str(out[0]["id"]))
+        except Exception as e:
+            print("⚠️ Sales Supabase sync xatosi:", type(e).__name__, e, flush=True)
+
+
+def _sb_sync_new_withdrawals():
+    for row in list(withdrawals):
+        wid = str(row.get("id", ""))
+        if wid and wid in SB_WITHDRAWALS_SYNCED:
+            continue
+        db_uid = SB_USER_IDS.get(str(row.get("user_id")))
+        if not db_uid:
+            continue
+        payload = {"user_id": db_uid, "amount": safe_int(row.get("amount")), "card": str(row.get("card", "")), "status": row.get("status", "pending"), "created_at": row.get("created_at")}
+        try:
+            out = _sb_request("POST", "withdrawals", payload, prefer="return=representation") or []
+            if out and out[0].get("id"):
+                row["id"] = str(out[0]["id"]); SB_WITHDRAWALS_SYNCED.add(str(out[0]["id"]))
+        except Exception as e:
+            print("⚠️ Withdrawal Supabase sync xatosi:", type(e).__name__, e, flush=True)
+
+
+def _sb_update_withdrawal(row):
+    wid = str(row.get("id", ""))
+    if not wid:
+        return
+    payload = {"status": row.get("status", "pending"), "approved_at": row.get("approved_at"), "rejected_at": row.get("rejected_at")}
+    _sb_request("PATCH", "withdrawals", payload, params={"id": f"eq.{wid}"}, prefer="return=minimal")
+    SB_WITHDRAWALS_SYNCED.add(wid)
+
+
 def save_json_data():
     try:
         tmp = DATA_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(DATA, f, ensure_ascii=False, indent=2)
         os.replace(tmp, DATA_FILE)
-        return True
     except Exception as e:
         print("❌ JSON saqlash xatosi:", type(e).__name__, e, flush=True)
         return False
+    if SUPABASE_ENABLED:
+        try:
+            _sb_sync_users(); _sb_sync_referrals(); _sb_sync_new_sales(); _sb_sync_new_withdrawals()
+            DATA["month"] = DATA.get("month", {}) or {}
+            _sb_request("POST", "settings", {"key":"month_state", "value": DATA["month"]}, params={"on_conflict":"key"}, prefer="resolution=merge-duplicates,return=minimal")
+            if month_reward:
+                current = month_reward.get("current_month") or datetime.now().strftime("%Y-%m")
+                _sb_request("POST", "month_rewards", {"month_key": current, "last_processed": month_reward.get("last_processed"), "current_month": current}, params={"on_conflict":"month_key"}, prefer="resolution=merge-duplicates,return=minimal")
+        except Exception as e:
+            print("⚠️ Supabase saqlash xatosi:", type(e).__name__, e, flush=True)
+            return False
+    return True
 
 
 DATA = load_json_data()
@@ -113,7 +306,38 @@ sales_rows = DATA["sales"]
 withdrawals = DATA["withdrawals"]
 month_reward = DATA["month_reward"]
 
-print("🗄 JSON: lokal saqlash faol", flush=True)
+# MOVIES_FILE/kinolar pastdagi kod bilan bir xil ishlaydi; Supabase bo'lsa keyin ustidan yuklanadi.
+MOVIES_FILE = "kinolar.json"
+MOVIE_BOT_USERNAME = os.environ.get("MOVIE_BOT_USERNAME", "").strip().lstrip("@").replace("https://t.me/", "").strip("/")
+try:
+    with open(MOVIES_FILE, "r", encoding="utf-8") as f:
+        kinolar = json.load(f)
+except Exception:
+    kinolar = {}
+
+print("☁️ Supabase: sozlangan" if SUPABASE_ENABLED else "🗄 JSON: lokal fallback", flush=True)
+
+
+def save_movies():
+    try:
+        with open(MOVIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(kinolar, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("❌ Kinolarni saqlash xatosi:", type(e).__name__, e, flush=True)
+        return False
+    if SUPABASE_ENABLED:
+        try:
+            for code, movie in kinolar.items():
+                _sb_request("POST", "movies", {
+                    "code": str(code), "name": movie.get("nom", "Nomsiz"), "year": safe_int(movie.get("yil"), 0) or None,
+                    "size": str(movie.get("hajm", "")), "genre": str(movie.get("janr", "")),
+                    "telegram_file_id": movie.get("video"), "video_type": movie.get("video_type", "video")
+                }, params={"on_conflict":"code"}, prefer="resolution=merge-duplicates,return=minimal")
+        except Exception as e:
+            print("⚠️ Movies Supabase sync xatosi:", type(e).__name__, e, flush=True)
+            return False
+    return True
+
 
 # =========================
 # FLASK
@@ -206,23 +430,7 @@ movie_generation_state = {}
 movie_add_state = {}
 withdraw_state = {}
 
-MOVIES_FILE = "kinolar.json"
-# Kino beruvchi alohida Telegram bot username
-MOVIE_BOT_USERNAME = os.environ.get("MOVIE_BOT_USERNAME", "").strip().lstrip("@").replace("https://t.me/", "").strip("/")
-try:
-    with open(MOVIES_FILE, "r", encoding="utf-8") as f:
-        kinolar = json.load(f)
-except Exception:
-    kinolar = {}
-
-def save_movies():
-    try:
-        with open(MOVIES_FILE, "w", encoding="utf-8") as f:
-            json.dump(kinolar, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as e:
-        print("❌ Kinolarni saqlash xatosi:", type(e).__name__, e, flush=True)
-        return False
+# MOVIES_FILE/kinolar/save_movies yuqorida tayyorlangan.
 
 
 # =========================
@@ -329,6 +537,14 @@ def level_from_ball(ball):
         return "🥉 Faol hamkor"
 
     return "🌱 Yangi hamkor"
+
+
+# Supabase yuklash safe_int/level_from_ball e'lon qilingandan keyin bajariladi.
+if SUPABASE_ENABLED:
+    try:
+        _load_from_supabase()
+    except Exception as e:
+        print("⚠️ Supabase startup xatosi, lokal JSON ishlatiladi:", type(e).__name__, e, flush=True)
 
 
 # =========================
@@ -2133,6 +2349,84 @@ def _location_palette(text):
     return ((75,105,135),(190,175,135))
 
 
+def _project_3d(x, y, z, w, h, camera_z=7.0):
+    # Oddiy perspektiv proyeksiya: haqiqiy 3D koordinata -> 2D kadr.
+    z = max(0.35, float(z) + camera_z)
+    f = min(w, h) * 0.62
+    return (w * 0.5 + float(x) * f / z, h * 0.48 - float(y) * f / z)
+
+
+def _draw_3d_line(d, a, b, w, h, fill, width=10):
+    pa = _project_3d(*a, w, h); pb = _project_3d(*b, w, h)
+    d.line([pa, pb], fill=fill, width=max(1, int(width)), joint="curve")
+
+
+def _draw_3d_mannequin(base, name, t, x_offset=0.0, depth=0.0, speaking=False, outfit=None):
+    d=ImageDraw.Draw(base, "RGBA")
+    phase=math.sin(t*math.pi*2 + (hashlib.sha256(str(name).encode()).digest()[0]%17))
+    sway=0.10*phase; arm=0.24*math.sin(t*math.pi*2+0.7); leg=0.18*math.sin(t*math.pi*2+3.0)
+    skin=_hash_color(name,1)+(255,); shirt=(outfit[0] if outfit else _hash_color(name,2))+(255,); pants=(outfit[1] if outfit else _hash_color(name,3))+(255,)
+    hair=_hash_color(name,4)+(255,)
+    x=x_offset; z=depth
+    hip=(x,0.0+sway,z); chest=(x,1.25+sway,z); neck=(x,1.72+sway,z); head=(x,2.18+sway,z)
+    ls=(x-0.48,1.35+sway,z); rs=(x+0.48,1.35+sway,z)
+    le=(x-0.72,0.82+sway+arm,z+0.10); re=(x+0.72,0.82+sway-arm,z+0.10)
+    lh=(x-0.23,-0.02,z); rh=(x+0.23,-0.02,z)
+    lk=(x-0.28,-0.88+leg,z+0.04); rk=(x+0.28,-0.88-leg,z+0.04)
+    lf=(x-0.36,-1.55+leg,z-0.08); rf=(x+0.36,-1.55-leg,z-0.08)
+    _draw_3d_line(d,ls,le,w,h,shirt,22); _draw_3d_line(d,le,(le[0]+(-0.18 if arm>0 else 0.18),le[1]-0.38,z),w,h,skin,16)
+    _draw_3d_line(d,rs,re,w,h,shirt,22); _draw_3d_line(d,re,(re[0]+(0.18 if arm>0 else -0.18),re[1]-0.38,z),w,h,skin,16)
+    _draw_3d_line(d,lh,lk,w,h,pants,27); _draw_3d_line(d,lk,lf,w,h,pants,24)
+    _draw_3d_line(d,rh,rk,w,h,pants,27); _draw_3d_line(d,rk,rf,w,h,pants,24)
+    # Torso: projected 3D box gives visible volume rather than flat 2D puppet.
+    pts=[]
+    for xx,yy,zz in [(-0.52,1.40,0),(0.52,1.40,0),(0.34,0.05,0),(-0.34,0.05,0),(-0.52,1.40,0.34),(0.52,1.40,0.34),(0.34,0.05,0.34),(-0.34,0.05,0.34)]:
+        pts.append(_project_3d(x+xx,yy+sway,z+zz,w,h))
+    d.polygon([pts[0],pts[1],pts[2],pts[3]],fill=shirt)
+    d.polygon([pts[1],pts[5],pts[6],pts[2]],fill=tuple(max(0,c-35) for c in shirt[:3])+(220,))
+    d.polygon([pts[0],pts[4],pts[7],pts[3]],fill=tuple(min(255,c+28) for c in shirt[:3])+(220,))
+    # Head sphere + hair highlight + face.
+    hx,hy=_project_3d(*head,w,h); r=max(12,int(0.30*min(w,h)/max(1.0,z+7.0)))
+    d.ellipse((hx-r,hy-r, hx+r,hy+r),fill=skin)
+    d.arc((hx-r,hy-r,hx+r,hy+r),200,340,fill=hair,width=max(2,r//5))
+    d.ellipse((hx-r//3,hy-r//5,hx-r//8,hy-r//20),fill=(255,255,255,80))
+    if speaking:
+        d.ellipse((hx-r//4,hy+r//4,hx+r//4,hy+r//2),fill=(55,20,20,180))
+
+
+def _make_3d_cinematic_background(state, scene_index, size):
+    w,h=size
+    # Gradient sky with atmospheric haze.
+    bg=Image.new("RGBA",(w,h),(18,28,48,255)); d=ImageDraw.Draw(bg,"RGBA")
+    for yy in range(h):
+        q=yy/max(1,h-1)
+        col=(int(28*(1-q)+7*q),int(45*(1-q)+18*q),int(76*(1-q)+28*q),255)
+        d.line((0,yy,w,yy),fill=col,width=1)
+    horizon=int(h*0.57)
+    # Distant city/forest silhouettes with depth scaling.
+    seed=hashlib.sha256((str(state.get("scene_texts",[""])[max(0,scene_index-1)])+str(scene_index)).encode()).digest()
+    for i in range(18):
+        bw=35+seed[i%32]%75; bh=35+seed[(i+7)%32]%110
+        x=int(i*w/18)+int(seed[(i+11)%32]%18)-10
+        d.rectangle((x,horizon-bh,x+bw,horizon),fill=(20,28,38,185))
+        if i%3==0:
+            for wy in range(horizon-bh+14,horizon-8,18):
+                d.rectangle((x+8,wy,x+12,wy+5),fill=(225,190,95,75))
+    # Ground plane: perspective grid, giving real depth cues.
+    vp=(w*0.5,horizon)
+    for i in range(-12,13):
+        endx=w*0.5+i*w*0.10
+        d.line([vp,(endx,h)],fill=(120,135,150,55),width=1)
+    for j in range(1,11):
+        q=(j/10.0)**1.7
+        y=horizon+(h-horizon)*q
+        d.line((0,y,w,y),fill=(120,135,150,45),width=1)
+    # Soft moon/light source.
+    lx=int(w*0.78); ly=int(h*0.18)
+    for rr,a in [(70,15),(48,25),(30,55)]: d.ellipse((lx-rr,ly-rr,lx+rr,ly+rr),fill=(230,235,255,a))
+    return bg
+
+
 def _make_background(state, scene_index, size):
     w,h=size
     if state.get("location_images"):
@@ -2145,6 +2439,11 @@ def _make_background(state, scene_index, size):
             return canvas.convert("RGBA").filter(ImageFilter.GaussianBlur(0.3))
         except Exception:
             pass
+    if MOVIE_3D_ENABLED:
+        try:
+            return _make_3d_cinematic_background(state, scene_index, size)
+        except Exception as e:
+            print("⚠️ 3D background fallback:", type(e).__name__, e, flush=True)
     a,b=_location_palette(state.get("scene_texts",[state.get("scenario","")])[max(0,scene_index-1)])
     bg=Image.new("RGBA",(w,h),a+(255,)); d=ImageDraw.Draw(bg,"RGBA")
     for yy in range(int(h*0.55),h):
@@ -2261,9 +2560,12 @@ def _render_scene(state, scene_index, total_scenes, job_dir, characters, puppets
             offset=(-170+i*170) if len(characters)>1 else 0
             local=frame.copy()
             if puppet["kind"]=="auto":
-                # shift skeleton horizontally for multiple actors
-                skel={k:(v[0]+offset,v[1]) for k,v in skel.items()}
-                _draw_auto_puppet(local,puppet,skel,t,speaking=(speaker==name and int(t*8)%2==0),outfit=_outfit_for(name,scene_index))
+                # 3D procedural mannequin: telefon/Renderga og'ir 3D model paketlari kerak emas.
+                if MOVIE_3D_ENABLED:
+                    _draw_3d_mannequin(local,name,t,x_offset=offset/190.0,depth=(i%MOVIE_3D_DEPTH)*0.16,speaking=(speaker==name and int(t*8)%2==0),outfit=_outfit_for(name,scene_index))
+                else:
+                    skel={k:(v[0]+offset,v[1]) for k,v in skel.items()}
+                    _draw_auto_puppet(local,puppet,skel,t,speaking=(speaker==name and int(t*8)%2==0),outfit=_outfit_for(name,scene_index))
             else:
                 skel={k:(v[0]+offset,v[1]) for k,v in skel.items()}
                 _draw_photo_puppet(local,puppet,skel,t,speaking=(speaker==name and int(t*8)%2==0),outfit=_outfit_for(name,scene_index))
@@ -2839,6 +3141,9 @@ def withdraw_admin_callback(call):
             item["status"] = "rejected"
             DATA["withdrawals"] = withdrawals
             save_json_data()
+            if SUPABASE_ENABLED:
+                try: _sb_update_withdrawal(item)
+                except Exception: pass
             bot.answer_callback_query(call.id, "❌ Foydalanuvchi balansida yetarli mablag' qolmagan.", show_alert=True)
             return
         user["balance"] = safe_int(user.get("balance")) - amount
@@ -2847,6 +3152,9 @@ def withdraw_admin_callback(call):
         save_user_to_json(uid)
         DATA["withdrawals"] = withdrawals
         save_json_data()
+        if SUPABASE_ENABLED:
+            try: _sb_update_withdrawal(item)
+            except Exception: pass
         bot.answer_callback_query(call.id, "✅ Pul yechish tasdiqlandi.")
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         try:
@@ -2996,39 +3304,28 @@ def unused_handler(message):
 # =========================
 
 def start_bot():
-
-    print(
-        "🚀 Kino Yasa Bot ishga tushmoqda...",
-        flush=True
-    )
-
-    print(
-        f"🤖 Bot: {BOT_NAME}",
-        flush=True
-    )
-
-    print(
-        "🗄 JSON: ulangan",
-        flush=True
-    )
-
-
-    print(
-        "🌐 Flask server ishga tushmoqda...",
-        flush=True
-    )
-
-    print(
-        "🤖 Telegram polling ishga tushmoqda...",
-        flush=True
-    )
-    print("🛠 Kino Yasa Bot v3: video retry + admin video qabul qilish + oy xabarlari catch-up faol", flush=True)
-
-    bot.infinity_polling(
-        skip_pending=True,
-        timeout=30,
-        long_polling_timeout=30
-    )
+    print("🚀 Kino Yasa Bot ishga tushmoqda...", flush=True)
+    print(f"🤖 Bot: {BOT_NAME}", flush=True)
+    print("☁️ Supabase: ulangan" if SUPABASE_ENABLED else "🗄 JSON: lokal fallback", flush=True)
+    print("🎞 3D procedural cinematic engine: " + ("ON" if MOVIE_3D_ENABLED else "OFF"), flush=True)
+    base_url = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    if base_url:
+        base_url = base_url.rstrip("/")
+        webhook_url = base_url + "/webhook"
+        try:
+            bot.remove_webhook()
+            time.sleep(0.5)
+            bot.set_webhook(url=webhook_url)
+            print(f"🌐 Flask + Telegram webhook: {webhook_url}", flush=True)
+            print("🛠 Render web service rejimi faol", flush=True)
+            port = int(os.environ.get("PORT", "10000"))
+            app.run(host="0.0.0.0", port=port, threaded=True)
+            return
+        except Exception as e:
+            print("❌ Webhook rejimi xatosi:", type(e).__name__, e, flush=True)
+            raise
+    print("🤖 Telegram polling ishga tushmoqda...", flush=True)
+    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
 
 
 # =========================
