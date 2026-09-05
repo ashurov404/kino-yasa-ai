@@ -35,9 +35,11 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
 
-# 3D procedural cinematic engine. Og'ir Blender/model paketlari telefonga o'rnatilmaydi.
+# Integrated 3D cinematic engine. Telefon faqat Telegram boshqaruvi qiladi.
+# Blender yoki og'ir model paketi telefon tomoniga o'rnatilmaydi.
 MOVIE_3D_ENABLED = os.environ.get("MOVIE_3D_ENABLED", "1").lower() not in ("0", "false", "no")
-MOVIE_3D_DEPTH = max(1, int(os.environ.get("MOVIE_3D_DEPTH", "6")))
+MOVIE_3D_DEPTH = max(1, int(os.environ.get("MOVIE_3D_DEPTH", "8")))
+MOVIE_3D_QUALITY = os.environ.get("MOVIE_3D_QUALITY", "high").lower()
 
 # AI API key
 
@@ -297,6 +299,60 @@ def save_json_data():
             print("⚠️ Supabase saqlash xatosi:", type(e).__name__, e, flush=True)
             return False
     return True
+
+
+def _sb_create_movie_job(uid, status="queued", progress=0, scene_count=None):
+    """Supabase movie_jobs ustunlariga mos render job yozadi."""
+    if not SUPABASE_ENABLED:
+        return None
+    db_uid = SB_USER_IDS.get(str(uid))
+    if not db_uid:
+        try:
+            _sb_sync_users()
+            db_uid = SB_USER_IDS.get(str(uid))
+        except Exception:
+            db_uid = None
+    if not db_uid:
+        return None
+    payload = {"user_id": db_uid, "status": status, "progress": safe_int(progress), "scene_count": scene_count}
+    try:
+        rows = _sb_request("POST", "movie_jobs", payload, prefer="return=representation") or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print("⚠️ movie_jobs yaratish xatosi:", type(e).__name__, e, flush=True)
+        return None
+
+
+def _sb_update_movie_job(job_id, **fields):
+    if not SUPABASE_ENABLED or not job_id:
+        return False
+    allowed = {"status", "progress", "eta_seconds", "scene_count", "output_path", "error_message", "started_at", "finished_at"}
+    payload = {k: v for k, v in fields.items() if k in allowed}
+    if not payload:
+        return True
+    try:
+        _sb_request("PATCH", "movie_jobs", payload, params={"id": f"eq.{job_id}"}, prefer="return=minimal")
+        return True
+    except Exception as e:
+        print("⚠️ movie_jobs yangilash xatosi:", type(e).__name__, e, flush=True)
+        return False
+
+
+def _sb_record_asset(uid, asset_type, storage_path, metadata=None):
+    if not SUPABASE_ENABLED:
+        return None
+    db_uid = SB_USER_IDS.get(str(uid))
+    if not db_uid:
+        return None
+    try:
+        rows = _sb_request("POST", "assets", {
+            "user_id": db_uid, "asset_type": str(asset_type), "storage_path": str(storage_path),
+            "metadata": metadata or {}
+        }, prefer="return=representation") or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print("⚠️ assets saqlash xatosi:", type(e).__name__, e, flush=True)
+        return None
 
 
 DATA = load_json_data()
@@ -603,7 +659,7 @@ def add_user(uid, name, username=None):
     return user
 
 print(
-    "🚀 Kino Yasa Bot 1/8-qism yuklandi",
+    "🚀 Kino Yasa Bot 1/8-qism yuklandi | Supabase + integrated 3D",
     flush=True
 )# ============================================================
 # KINO YASA BOT
@@ -2361,37 +2417,103 @@ def _draw_3d_line(d, a, b, w, h, fill, width=10):
     d.line([pa, pb], fill=fill, width=max(1, int(width)), joint="curve")
 
 
+def _shade(rgb, factor):
+    return tuple(max(0, min(255, int(c * factor))) for c in rgb)
+
+
 def _draw_3d_mannequin(base, name, t, x_offset=0.0, depth=0.0, speaking=False, outfit=None):
-    d=ImageDraw.Draw(base, "RGBA")
-    phase=math.sin(t*math.pi*2 + (hashlib.sha256(str(name).encode()).digest()[0]%17))
-    sway=0.10*phase; arm=0.24*math.sin(t*math.pi*2+0.7); leg=0.18*math.sin(t*math.pi*2+3.0)
-    skin=_hash_color(name,1)+(255,); shirt=(outfit[0] if outfit else _hash_color(name,2))+(255,); pants=(outfit[1] if outfit else _hash_color(name,3))+(255,)
-    hair=_hash_color(name,4)+(255,)
-    x=x_offset; z=depth
-    hip=(x,0.0+sway,z); chest=(x,1.25+sway,z); neck=(x,1.72+sway,z); head=(x,2.18+sway,z)
-    ls=(x-0.48,1.35+sway,z); rs=(x+0.48,1.35+sway,z)
-    le=(x-0.72,0.82+sway+arm,z+0.10); re=(x+0.72,0.82+sway-arm,z+0.10)
-    lh=(x-0.23,-0.02,z); rh=(x+0.23,-0.02,z)
-    lk=(x-0.28,-0.88+leg,z+0.04); rk=(x+0.28,-0.88-leg,z+0.04)
-    lf=(x-0.36,-1.55+leg,z-0.08); rf=(x+0.36,-1.55-leg,z-0.08)
-    _draw_3d_line(d,ls,le,w,h,shirt,22); _draw_3d_line(d,le,(le[0]+(-0.18 if arm>0 else 0.18),le[1]-0.38,z),w,h,skin,16)
-    _draw_3d_line(d,rs,re,w,h,shirt,22); _draw_3d_line(d,re,(re[0]+(0.18 if arm>0 else -0.18),re[1]-0.38,z),w,h,skin,16)
-    _draw_3d_line(d,lh,lk,w,h,pants,27); _draw_3d_line(d,lk,lf,w,h,pants,24)
-    _draw_3d_line(d,rh,rk,w,h,pants,27); _draw_3d_line(d,rk,rf,w,h,pants,24)
-    # Torso: projected 3D box gives visible volume rather than flat 2D puppet.
-    pts=[]
-    for xx,yy,zz in [(-0.52,1.40,0),(0.52,1.40,0),(0.34,0.05,0),(-0.34,0.05,0),(-0.52,1.40,0.34),(0.52,1.40,0.34),(0.34,0.05,0.34),(-0.34,0.05,0.34)]:
-        pts.append(_project_3d(x+xx,yy+sway,z+zz,w,h))
-    d.polygon([pts[0],pts[1],pts[2],pts[3]],fill=shirt)
-    d.polygon([pts[1],pts[5],pts[6],pts[2]],fill=tuple(max(0,c-35) for c in shirt[:3])+(220,))
-    d.polygon([pts[0],pts[4],pts[7],pts[3]],fill=tuple(min(255,c+28) for c in shirt[:3])+(220,))
-    # Head sphere + hair highlight + face.
-    hx,hy=_project_3d(*head,w,h); r=max(12,int(0.30*min(w,h)/max(1.0,z+7.0)))
-    d.ellipse((hx-r,hy-r, hx+r,hy+r),fill=skin)
-    d.arc((hx-r,hy-r,hx+r,hy+r),200,340,fill=hair,width=max(2,r//5))
-    d.ellipse((hx-r//3,hy-r//5,hx-r//8,hy-r//20),fill=(255,255,255,80))
+    """Integrated lightweight 3D human: volumetric body, perspective, lighting, shadow and animation."""
+    d = ImageDraw.Draw(base, "RGBA")
+    seed = hashlib.sha256(str(name).encode("utf-8")).digest()
+    phase = math.sin(t * math.pi * 2 + seed[0] % 17)
+    sway = 0.10 * phase
+    arm = 0.24 * math.sin(t * math.pi * 2 + 0.7)
+    leg = 0.18 * math.sin(t * math.pi * 2 + 3.0)
+    x = x_offset
+    z = depth
+    skin0 = _hash_color(name, 1)
+    shirt0 = outfit[0] if outfit else _hash_color(name, 2)
+    pants0 = outfit[1] if outfit else _hash_color(name, 3)
+    hair0 = _hash_color(name, 4)
+
+    # Contact shadow / depth cue.
+    ground = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(ground, "RGBA")
+    gx, gy = _project_3d(x, -1.53, z, base.width, base.height)
+    rr = max(18, int(70 / (1.0 + z * 0.08)))
+    gd.ellipse((gx-rr, gy-rr//4, gx+rr, gy+rr//4), fill=(0, 0, 0, 90))
+    ground = ground.filter(ImageFilter.GaussianBlur(max(2, rr//5)))
+    base.alpha_composite(ground)
+
+    def P(px, py, pz=0.0):
+        return _project_3d(x + px, py + sway, z + pz, base.width, base.height)
+
+    # Anatomical anchor points.
+    hip = (0.0, 0.0, 0.0); chest = (0.0, 1.24, 0.0); neck = (0.0, 1.72, 0.0); head = (0.0, 2.18, 0.0)
+    ls = (-0.48, 1.36, 0.02); rs = (0.48, 1.36, 0.02)
+    le = (-0.73, 0.83 + arm, 0.10); re = (0.73, 0.83 - arm, 0.10)
+    lh = (-0.23, -0.02, 0.0); rh = (0.23, -0.02, 0.0)
+    lk = (-0.28, -0.88 + leg, 0.04); rk = (0.28, -0.88 - leg, 0.04)
+    lf = (-0.36, -1.55 + leg, -0.08); rf = (0.36, -1.55 - leg, -0.08)
+
+    # Legs as cylindrical-ish layered limbs.
+    for a, b, width, col in [(lh, lk, 30, pants0), (lk, lf, 26, pants0), (rh, rk, 30, _shade(pants0, .88)), (rk, rf, 26, pants0)]:
+        _draw_3d_line(d, P(*a), P(*b), base.width, base.height, col + (255,), width)
+    # Shoes.
+    for foot in (lf, rf):
+        fx, fy = P(*foot)
+        sr = 16
+        d.ellipse((fx-sr, fy-sr//2, fx+sr*2, fy+sr//2), fill=(28, 30, 34, 255))
+
+    # Torso as a real volume with front/side/top faces.
+    verts = [P(-0.54,1.42,0.0), P(0.54,1.42,0.0), P(0.38,0.02,0.0), P(-0.38,0.02,0.0),
+             P(-0.46,1.38,0.40), P(0.46,1.38,0.40), P(0.31,0.06,0.40), P(-0.31,0.06,0.40)]
+    d.polygon([verts[0],verts[1],verts[2],verts[3]], fill=shirt0+(255,))
+    d.polygon([verts[1],verts[5],verts[6],verts[2]], fill=_shade(shirt0,.62)+(235,))
+    d.polygon([verts[0],verts[4],verts[7],verts[3]], fill=_shade(shirt0,1.12)+(220,))
+    d.polygon([verts[4],verts[5],verts[1],verts[0]], fill=_shade(shirt0,1.20)+(235,))
+
+    # Arms, elbows and hands.
+    _draw_3d_line(d, P(*ls), P(*le), base.width, base.height, shirt0+(255,), 24)
+    _draw_3d_line(d, P(*rs), P(*re), base.width, base.height, _shade(shirt0,.88)+(255,), 24)
+    lhnd = (le[0]-0.18 if arm > 0 else le[0]+0.18, le[1]-0.38, le[2]+0.02)
+    rhnd = (re[0]+0.18 if arm > 0 else re[0]-0.18, re[1]-0.38, re[2]+0.02)
+    _draw_3d_line(d, P(*le), P(*lhnd), base.width, base.height, skin0+(255,), 15)
+    _draw_3d_line(d, P(*re), P(*rhnd), base.width, base.height, _shade(skin0,.94)+(255,), 15)
+
+    # Neck.
+    nx, ny = P(*neck)
+    d.ellipse((nx-20,ny-28,nx+20,ny+28), fill=skin0+(255,))
+
+    # Head: layered spheres with highlight/shadow, ears, nose, eyes and mouth.
+    hx, hy = P(*head)
+    hr = max(24, int(0.34 * min(base.width, base.height) / max(1.0, z + 7.0)))
+    d.ellipse((hx-hr,hy-hr,hx+hr,hy+hr), fill=_shade(skin0,.82)+(255,))
+    d.ellipse((hx-hr+4,hy-hr+3,hx+hr-3,hy+hr-6), fill=skin0+(255,))
+    # Ears
+    d.ellipse((hx-hr-7,hy-10,hx-hr+8,hy+16), fill=_shade(skin0,.90)+(255,))
+    d.ellipse((hx+hr-8,hy-10,hx+hr+7,hy+16), fill=_shade(skin0,.90)+(255,))
+    # Hair cap
+    d.pieslice((hx-hr-2,hy-hr-4,hx+hr+2,hy+hr//2), 180, 360, fill=hair0+(255,))
+    d.polygon([(hx-hr+3,hy-hr//3),(hx-hr//3,hy-hr-2),(hx+hr//4,hy-hr//2),(hx+hr-4,hy-hr//5)], fill=_shade(hair0,.78)+(255,))
+    # Eyes and brows
+    eye_y = hy-2
+    for ex in (hx-int(hr*.34), hx+int(hr*.34)):
+        d.line((ex-int(hr*.16),eye_y-int(hr*.18),ex+int(hr*.10),eye_y-int(hr*.22)), fill=(45,35,30,255), width=max(2,hr//13))
+        d.ellipse((ex-hr//9,eye_y-hr//12,ex+hr//9,eye_y+hr//10), fill=(245,245,240,255))
+        d.ellipse((ex-hr//25,eye_y-hr//28,ex+hr//18,eye_y+hr//25), fill=(35,35,35,255))
+    # Nose / cheek light
+    d.line((hx,hy+2,hx-hr//12,hy+hr//5,hx+hr//10,hy+hr//5), fill=_shade(skin0,.70)+(190,), width=max(1,hr//18))
+    d.ellipse((hx-hr//2,hy+hr//6,hx-hr//6,hy+hr//2), fill=(210,90,95,22))
+    d.ellipse((hx+hr//6,hy+hr//6,hx+hr//2,hy+hr//2), fill=(210,90,95,18))
+    # Mouth animation for speech.
     if speaking:
-        d.ellipse((hx-r//4,hy+r//4,hx+r//4,hy+r//2),fill=(55,20,20,180))
+        d.ellipse((hx-hr//4,hy+hr//3,hx+hr//4,hy+hr//2), fill=(55,18,20,230))
+        d.arc((hx-hr//5,hy+hr//4,hx+hr//5,hy+hr//2), 10, 170, fill=(235,170,170,210), width=max(1,hr//16))
+    else:
+        d.arc((hx-hr//4,hy+hr//5,hx+hr//4,hy+hr//2), 5, 175, fill=(100,45,50,210), width=max(1,hr//18))
+    # Eye/head highlight for cinematic light.
+    d.ellipse((hx-int(hr*.45),hy-int(hr*.48),hx-int(hr*.20),hy-int(hr*.20)), fill=(255,255,255,70))
 
 
 def _make_3d_cinematic_background(state, scene_index, size):
@@ -2620,6 +2742,7 @@ def _prepare_local_assets(state, job_dir):
         try:
             path=os.path.join(job_dir,f"location_{i:02d}.jpg")
             _download_telegram_photo(file_id,path)
+            _sb_record_asset(state.get("user_id"), "location_photo", path, {"telegram_file_id": file_id, "index": i})
             state["location_local_images"].append(path)
         except Exception as e:
             print("Lokatsiya rasmini olish xatosi:",type(e).__name__,e,flush=True)
@@ -2631,6 +2754,7 @@ def _prepare_local_assets(state, job_dir):
         try:
             path=os.path.join(job_dir,"actor_"+re.sub(r"[^\w-]","_",role)+".jpg")
             _download_telegram_photo(file_id,path)
+            _sb_record_asset(state.get("user_id"), "actor_photo", path, {"role": role, "telegram_file_id": file_id})
             puppets[role]=_make_photo_puppet(path)
         except Exception:
             puppets[role]=_make_auto_puppet(role)
@@ -2654,7 +2778,7 @@ def start_ai_movie(message):
         bot.send_message(message.chat.id,"❌ Foydalanuvchi ma'lumotlari topilmadi.")
         return
     users[uid]=user
-    movie_generation_state[uid]={"step":"description","created_at":time.time(),"characters":[],"actor_photos":[],"location_images":[]}
+    movie_generation_state[uid]={"step":"description","created_at":time.time(),"user_id":int(uid),"characters":[],"actor_photos":[],"location_images":[]}
     bot.send_message(message.chat.id,"🎬 <b>Kino yaratish</b>\n\n📝 Ssenariyni to'liq yozing.\n\nMasalan:\n<b>Sardor:</b> Salom, Malika. Bugun safarga chiqamiz.\n<b>Malika:</b> Mayli, ketdik.\n\nSsenariyda ism: dialog shaklida yozilsa, bot dialog egasini aniq bog'laydi.")
 
 
@@ -2748,6 +2872,9 @@ def generate_video_callback(call):
             scene_count=_scene_count_for_duration(minutes)
             state["scene_texts"]=[base_sentences[i%len(base_sentences)] for i in range(scene_count)]
             dialogue_map=state.get("dialogues",[])
+            state["movie_job"]=_sb_create_movie_job(uid, "running", 0, scene_count)
+            job_id=(state.get("movie_job") or {}).get("id")
+            _sb_update_movie_job(job_id, status="running", progress=0, scene_count=scene_count, started_at=datetime.now().isoformat())
             video_files=[]
             started=time.time()
             last_status=0.0
@@ -2761,6 +2888,7 @@ def generate_video_callback(call):
                     eta=remaining/rate if rate>0 else 0
                     mins_eta=int(eta//60); secs_eta=int(eta%60)
                     pct=idx*100/scene_count
+                    _sb_update_movie_job(job_id, status="running", progress=int(pct), eta_seconds=int(eta), scene_count=scene_count)
                     # Foydalanuvchiga texnik progress yuborilmaydi.
                     # Admin uchun bitta xabar ichida progress yangilanadi.
                     try:
@@ -2781,6 +2909,7 @@ def generate_video_callback(call):
                 raise RuntimeError("Yakuniy kino fayli yaratilmadi")
             video_size=os.path.getsize(output)
             state["video_path"]=output; state["video_url"]=None; state["video_size"]=video_size; state["video_job_running"]=False
+            _sb_update_movie_job(job_id, status="completed", progress=100, eta_seconds=0, output_path=output, finished_at=datetime.now().isoformat())
             print(f"🎬 Render tayyor: {output} | {video_size/1024/1024:.2f} MB", flush=True)
 
             # Telegramga yuborish alohida bosqich: video tayyor bo'lsa ham upload
@@ -2837,6 +2966,10 @@ def generate_video_callback(call):
                     pass
         except Exception as e:
             state["video_job_running"]=False; state["step"]="video_ready"
+            try:
+                _sb_update_movie_job((state.get("movie_job") or {}).get("id"), status="failed", progress=0, error_message=f"{type(e).__name__}: {e}", finished_at=datetime.now().isoformat())
+            except Exception:
+                pass
             print("❌ Kino jarayoni xatosi:",type(e).__name__,e,flush=True)
             # To'liq texnik xato faqat admin uchun. Oddiy userga qisqa xabar.
             try:
@@ -3284,7 +3417,7 @@ print(
 
 # ============================================================
 # KINO YASA BOT
-# 8/8-QISM — YAKUNIY ISHGA TUSHIRISH / AI-SIZ KINO
+# 8/8-QISM — YAKUNIY ISHGA TUSHIRISH / INTEGRATED 3D + SUPABASE
 # ============================================================
 
 
