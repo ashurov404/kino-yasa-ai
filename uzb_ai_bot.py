@@ -2186,7 +2186,7 @@ print(
 # KINO YASA BOT — AI-SIZ PUPPET/SCENE ENGINE
 # ============================================================
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 import hashlib
 import math
 import wave
@@ -2633,15 +2633,17 @@ def _make_3d_cinematic_background(state, scene_index, size):
         if i%3==0:
             for wy in range(horizon-bh+14,horizon-8,18):
                 d.rectangle((x+8,wy,x+12,wy+5),fill=(225,190,95,75))
-    # Ground plane: perspective grid, giving real depth cues.
+    # Cinematic ground: soft perspective bands instead of a game-like wire grid.
+    for j in range(1, 9):
+        q=(j/8.0)**1.8
+        y=int(horizon+(h-horizon)*q)
+        alpha=max(8, 34-j*3)
+        d.line((0,y,w,y),fill=(155,170,180,alpha),width=2)
+    # A few very soft depth guides; they disappear into atmospheric haze.
     vp=(w*0.5,horizon)
-    for i in range(-12,13):
-        endx=w*0.5+i*w*0.10
-        d.line([vp,(endx,h)],fill=(120,135,150,55),width=1)
-    for j in range(1,11):
-        q=(j/10.0)**1.7
-        y=horizon+(h-horizon)*q
-        d.line((0,y,w,y),fill=(120,135,150,45),width=1)
+    for i in (-7,-4,-2,2,4,7):
+        endx=w*0.5+i*w*0.115
+        d.line([vp,(endx,h)],fill=(145,160,170,24),width=2)
     # Soft moon/light source.
     lx=int(w*0.78); ly=int(h*0.18)
     for rr,a in [(70,15),(48,25),(30,55)]: d.ellipse((lx-rr,ly-rr,lx+rr,ly+rr),fill=(230,235,255,a))
@@ -2753,6 +2755,29 @@ def _scene_action(sentence):
     return "idle"
 
 
+def _cinematic_grade(frame, scene_index, t):
+    """Final material/light pass: soft highlights, contrast, depth and vignette."""
+    rgb=frame.convert("RGB")
+    rgb=ImageEnhance.Contrast(rgb).enhance(1.08)
+    rgb=ImageEnhance.Color(rgb).enhance(1.06)
+    # Subtle warm/cool light separation without changing the scene palette.
+    overlay=Image.new("RGBA", rgb.size, (255, 238, 210, 0))
+    od=ImageDraw.Draw(overlay, "RGBA")
+    w,h=rgb.size
+    light_alpha=int(18+10*(0.5+0.5*math.sin((t+scene_index*0.13)*math.pi*2)))
+    od.ellipse((int(w*.58),int(h*.02),int(w*.98),int(h*.52)), fill=(255,245,220,light_alpha))
+    graded=Image.alpha_composite(rgb.convert("RGBA"), overlay)
+    # Cinematic vignette.
+    vig=Image.new("L",(w,h),0)
+    vd=ImageDraw.Draw(vig)
+    vd.ellipse((int(-w*.08),int(-h*.08),int(w*1.08),int(h*1.08)),fill=180)
+    vig=vig.filter(ImageFilter.GaussianBlur(max(18,int(min(w,h)*.06))))
+    shade=Image.new("RGBA",(w,h),(0,0,0,0))
+    shade.putalpha(vig.point(lambda a: max(0, 180-a)))
+    graded=Image.alpha_composite(graded,shade)
+    return graded.convert("RGB")
+
+
 def _render_scene(state, scene_index, total_scenes, job_dir, characters, puppets, dialogue_map):
     scene_dir=os.path.join(job_dir,f"scene_{scene_index:04d}")
     os.makedirs(scene_dir,exist_ok=True)
@@ -2829,7 +2854,10 @@ def _render_scene(state, scene_index, total_scenes, job_dir, characters, puppets
             d.rounded_rectangle((28,MOVIE_HEIGHT-92,MOVIE_WIDTH-28,MOVIE_HEIGHT-24),radius=16,fill=(0,0,0,80))
             d.text((48,MOVIE_HEIGHT-74),caption,font=_safe_font(20),fill=(255,255,255,225))
         frame=_add_camera_motion(frame,t,scene_index)
-        frame.convert("RGB").save(os.path.join(scene_dir,f"frame_{fi:05d}.jpg"),quality=90)
+        # Ichki ikki bosqich: harakat/geometriya -> yakuniy rang/material/yorug'lik.
+        # Foydalanuvchiga faqat yakuniy kadr ko'rsatiladi.
+        frame=_cinematic_grade(frame,scene_index,t)
+        frame.save(os.path.join(scene_dir,f"frame_{fi:05d}.jpg"),quality=92)
     video_path=os.path.join(job_dir,f"scene_{scene_index:04d}.mp4")
     if not shutil.which("ffmpeg"):
         raise RuntimeError("FFmpeg topilmadi")
@@ -3002,11 +3030,21 @@ def generate_video_callback(call):
         bot.answer_callback_query(call.id,"⏳ Kino allaqachon yaratilmoqda."); return
     state["price"]=price; state["video_job_running"]=True; state["step"]="rendering"
     bot.answer_callback_query(call.id,"🎬 Kino yaratish boshlandi")
-    # Status foydalanuvchiga alohida oddiy xabar sifatida yuboriladi. Callback oynasida emas.
-    # Render texnik jarayoni oddiy foydalanuvchiga ko'rsatilmaydi.
-    # Monitoring faqat server loglari/admin uchun.
+    # Foydalanuvchiga bitta xabar ichida jonli render holati ko'rsatiladi.
+    # Xabar har bir necha soniyada yangilanadi, spam qilinmaydi.
     status_msg = None
     admin_status_msg = None
+    scene_count_preview = _scene_count_for_duration(minutes)
+    try:
+        status_msg = bot.send_message(
+            call.message.chat.id,
+            f"🎬 <b>Kino tayyorlanmoqda...</b>\n\n"
+            f"🎞 <b>Epizodlar:</b> 0/{scene_count_preview}\n"
+            f"📊 <b>Kino qolgan foiz:</b> 100%\n"
+            f"⏱ <b>Qancha qolgan:</b> hisoblanmoqda..."
+        )
+    except Exception:
+        status_msg = None
     if ADMIN_ID and call.message.chat.id != ADMIN_ID:
         try:
             admin_status_msg = bot.send_message(
@@ -3025,7 +3063,7 @@ def generate_video_callback(call):
                 puppets.setdefault(name,_make_auto_puppet(name))
             # Scene text repeats/cycles naturally to fill requested duration.
             base_sentences=_scenario_sentences(state.get("scenario",""))
-            scene_count=_scene_count_for_duration(minutes)
+            scene_count=scene_count_preview
             state["scene_texts"]=[base_sentences[i%len(base_sentences)] for i in range(scene_count)]
             dialogue_map=state.get("dialogues",[])
             state["movie_job"]=_sb_create_movie_job(uid, "running", 0, scene_count)
@@ -3045,7 +3083,21 @@ def generate_video_callback(call):
                     mins_eta=int(eta//60); secs_eta=int(eta%60)
                     pct=idx*100/scene_count
                     _sb_update_movie_job(job_id, status="running", progress=int(pct), eta_seconds=int(eta), scene_count=scene_count)
-                    # Foydalanuvchiga texnik progress yuborilmaydi.
+                    # Foydalanuvchiga ham oldingi kelishilgan formatda progress.
+                    try:
+                        if status_msg:
+                            remaining_pct=max(0, 100-int(round(pct)))
+                            eta_text=(f"{mins_eta} daqiqa {secs_eta} soniya"
+                                      if mins_eta else f"{secs_eta} soniya")
+                            bot.edit_message_text(
+                                f"🎬 <b>Kino tayyorlanmoqda...</b>\n\n"
+                                f"🎞 <b>Epizodlar:</b> {idx}/{scene_count}\n"
+                                f"📊 <b>Kino qolgan foiz:</b> {remaining_pct}%\n"
+                                f"⏱ <b>Qancha qolgan:</b> {eta_text}",
+                                call.message.chat.id, status_msg.message_id
+                            )
+                    except Exception:
+                        pass
                     # Admin uchun bitta xabar ichida progress yangilanadi.
                     try:
                         if admin_status_msg:
@@ -3067,6 +3119,18 @@ def generate_video_callback(call):
             state["video_path"]=output; state["video_url"]=None; state["video_size"]=video_size; state["video_job_running"]=False
             _sb_update_movie_job(job_id, status="completed", progress=100, eta_seconds=0, output_path=output, finished_at=datetime.now().isoformat())
             print(f"🎬 Render tayyor: {output} | {video_size/1024/1024:.2f} MB", flush=True)
+            try:
+                if status_msg:
+                    bot.edit_message_text(
+                        "🎬 <b>Kino tayyor!</b>\n\n"
+                        f"🎞 <b>Epizodlar:</b> {scene_count}/{scene_count}\n"
+                        "📊 <b>Kino qolgan foiz:</b> 0%\n"
+                        "⏱ <b>Qancha qolgan:</b> 0 soniya\n\n"
+                        "📤 Video Telegramga yuborilmoqda...",
+                        call.message.chat.id, status_msg.message_id
+                    )
+            except Exception:
+                pass
 
             # Telegramga yuborish alohida bosqich: video tayyor bo'lsa ham upload
             # muvaffaqiyatsiz tugashi mumkin. Foydalanuvchiga aniq xabar beramiz.
@@ -3142,7 +3206,14 @@ def generate_video_callback(call):
             except Exception:
                 pass
             try:
-                bot.send_message(call.message.chat.id,"❌ Kino yaratib bo'lmadi. Iltimos, qayta urinib ko'ring.",reply_markup=_movie_buttons(uid,"create"))
+                if status_msg:
+                    bot.edit_message_text(
+                        "❌ <b>Kino yaratib bo'lmadi.</b>\n\n"
+                        "Iltimos, qayta urinib ko'ring.",
+                        call.message.chat.id, status_msg.message_id
+                    )
+                else:
+                    bot.send_message(call.message.chat.id,"❌ Kino yaratib bo'lmadi. Iltimos, qayta urinib ko'ring.",reply_markup=_movie_buttons(uid,"create"))
             except Exception:
                 pass
     threading.Thread(target=worker,daemon=True).start()
