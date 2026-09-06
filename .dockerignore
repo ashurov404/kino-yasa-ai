@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+.env
+.venv/
+venv/
+storage/
+tmp/
+temp/
+*.mp4
+*.mov
+*.avi
+*.mkv

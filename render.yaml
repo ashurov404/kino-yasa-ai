@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: kino-yasa-ai-3d
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: FOURD_HUMANS_ENABLED
+        value: "1"
+      - key: BLENDER_ENABLED
+        value: "1"
+      - key: FOURD_HUMANS_DIR
+        value: "/opt/4D-Humans"
+      - key: BLENDER_BIN
+        value: "/usr/bin/blender"
