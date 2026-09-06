@@ -7,6 +7,7 @@ import threading
 import calendar
 import re
 import subprocess
+import html
 import requests
 
 from datetime import datetime, timedelta
@@ -48,14 +49,14 @@ MOVIE_3D_QUALITY = os.environ.get("MOVIE_3D_QUALITY", "high").lower()
 # ============================================================
 # Bu generator generativ video AI xizmatlaridan foydalanmaydi.
 # 2D puppet/skeletal animatsiya, Pillow/OpenCV va FFmpeg asosida ishlaydi.
-MOVIE_FPS = int(os.environ.get("MOVIE_FPS", "5"))
+MOVIE_FPS = int(os.environ.get("MOVIE_FPS", "8"))
 MOVIE_WIDTH = int(os.environ.get("MOVIE_WIDTH", "854"))
 MOVIE_HEIGHT = int(os.environ.get("MOVIE_HEIGHT", "480"))
 MOVIE_SCENE_SECONDS = float(os.environ.get("MOVIE_SCENE_SECONDS", "12"))
 MOVIE_MAX_SCENES = int(os.environ.get("MOVIE_MAX_SCENES", "600"))
 MOVIE_RENDER_THREADS = max(1, int(os.environ.get("MOVIE_RENDER_THREADS", "1")))
 MOVIE_TTS_ENABLED = os.environ.get("MOVIE_TTS_ENABLED", "1").lower() not in ("0", "false", "no")
-MOVIE_TTS_VOICE = os.environ.get("MOVIE_TTS_VOICE", "tr")
+MOVIE_TTS_VOICE = os.environ.get("MOVIE_TTS_VOICE", "uz")
 MOVIE_JOBS_DIR = os.environ.get("MOVIE_JOBS_DIR", "kino_jobs")
 
 # =========================
@@ -518,8 +519,10 @@ def send_ai_text(chat_id, title, text, reply_markup=None):
     text = str(text or "").strip()
     if not text:
         return
+    # AI matni HTML parse_mode sabab botni yiqitmasin. Sarlavha esa mavjud HTML bilan qoladi.
+    safe_text = html.escape(text, quote=False)
     limit = 3900
-    parts = [text[i:i+limit] for i in range(0, len(text), limit)]
+    parts = [safe_text[i:i+limit] for i in range(0, len(safe_text), limit)]
     for i, part in enumerate(parts):
         prefix = title if i == 0 else ""
         markup = reply_markup if i == len(parts) - 1 else None
@@ -934,6 +937,25 @@ def _scenario_prompt(description):
         "Matn faqat o'zbek tilida bo'lsin.\n\nFOYDALANUVCHI G'OYASI:\n" + str(description) + "\n\n"
         "Format: 🎬 Kino nomi; 🎭 Janr; 👤 Qahramonlar; 🎞 Sahnalar; 💬 Dialoglar; 🏁 Yakun.\n"
     )
+
+def _build_fallback_screenplay(idea):
+    """OpenRouter ishlamasa ham foydalanuvchi g'oyasi xom matn sifatida qaytmasin."""
+    idea=str(idea or "").strip()
+    return ("🎬 Kino nomi: Hikoya\n"
+            "🎭 Janr: Drama\n\n"
+            "👤 Qahramonlar:\n"
+            "- Qahramon 1 — asosiy qahramon\n"
+            "- Qahramon 2 — suhbatdosh\n\n"
+            "🎞 1-sahna — Boshlanish\n"
+            f"Joy va vaqt: voqea boshlanadi. {idea}\n"
+            "Harakat: Qahramon 1 vaziyatni kuzatadi va atrofga qaraydi. Kamera umumiy plandan yaqin planga o'tadi.\n"
+            "\n💬 Dialoglar:\n"
+            "Qahramon 1: Men bu voqeani oxirigacha hal qilaman.\n"
+            "Qahramon 2: Unda birga harakat qilamiz.\n\n"
+            "🎞 2-sahna — Rivoj\n"
+            "Qahramonlar harakatlanadi, vaziyat o'zgaradi va voqea tabiiy ravishda davom etadi.\n\n"
+            "🏁 Yakun\nQahramonlar voqeani yakunlaydi.")
+
 
 def _duration_prompt(state, duration):
     return (
@@ -2308,17 +2330,79 @@ def _make_skeleton(w, h):
     }
 
 
-def _outfit_for(name, scene_index):
-    outfits = [
-        ((48, 92, 170), (35, 45, 65)),
-        ((150, 55, 55), (55, 55, 60)),
-        ((45, 125, 75), (45, 50, 40)),
-        ((170, 125, 45), (55, 70, 105)),
-        ((115, 65, 145), (50, 45, 60)),
-        ((55, 125, 135), (70, 55, 40)),
-    ]
-    idx=(hashlib.sha256((str(name)+str(scene_index//3)).encode("utf-8")).digest()[0]) % len(outfits)
-    return outfits[idx]
+def _outfit_for(name, scene_index, scene_text=""):
+    """Ssenariyga qarab kiyim tanlaydi; bir xil kiyimni majburan takrorlamaydi."""
+    low=str(scene_text or "").lower()
+    if any(x in low for x in ("forma", "maktab", "o'qituvchi", "o‘qituvchi")):
+        pool=[((45,55,90),(35,35,45)),((80,80,95),(45,45,55))]
+    elif any(x in low for x in ("shifokor", "kasalxona", "doktor")):
+        pool=[((235,235,240),(210,210,220)),((190,215,225),(175,190,200))]
+    elif any(x in low for x in ("sport", "mashg'ulot", "mashg‘ulot")):
+        pool=[((35,75,150),(35,35,45)),((150,45,55),(40,45,55))]
+    elif any(x in low for x in ("to'y", "tug'ilgan kun", "bayram", "tadbir")):
+        pool=[((35,35,45),(20,20,25)),((95,65,120),(30,30,40))]
+    elif any(x in low for x in ("tun", "kecha", "kechasi")):
+        pool=[((35,45,70),(25,30,40)),((70,55,85),(35,35,45))]
+    elif any(x in low for x in ("ish", "ofis", "uchrashuv", "majlis")):
+        pool=[((55,65,80),(30,35,45)),((100,80,55),(35,35,40))]
+    else:
+        pool=[((55,85,150),(35,40,55)),((145,65,65),(45,45,50)),((55,120,85),(40,45,40)),((170,125,55),(45,55,75)),((105,70,140),(45,40,55))]
+    digest=hashlib.sha256((str(name)+"|"+str(scene_index//2)+"|"+low[:160]).encode("utf-8")).digest()
+    return pool[digest[0] % len(pool)]
+
+
+def _scene_active_characters(sentence, characters, dialogue_map, scene_index):
+    """Kadrga hamma qahramonni tiqmaydi: sahnaga tegishli 1-2 kishini tanlaydi."""
+    if not characters:
+        return []
+    low=str(sentence or "").lower()
+    mentioned=[n for n in characters if n.lower() in low]
+    speakers=[d.get("speaker") for d in dialogue_map if d.get("speaker") and d.get("text") and d.get("text").lower() in low]
+    active=[]
+    for n in mentioned + speakers:
+        if n in characters and n not in active:
+            active.append(n)
+    if active:
+        # Dialog sahnasida ko'pi bilan ikki suhbatdosh; qolganlar boshqa kadrga o'tadi.
+        return active[:2]
+    # Dialog bo'lmagan sahnada qahramonlar navbat bilan ko'rinadi; to'rt kishilik statik saf bo'lmaydi.
+    n=max(1, min(2, len(characters)))
+    start=(scene_index-1)%len(characters)
+    return [characters[(start+j)%len(characters)] for j in range(n)]
+
+
+def _audio_energy_curve(path, samples=256):
+    """Ovoz amplitudasini kadrlar uchun qaytaradi; lab ochilishi ovozga bog'lanadi."""
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with wave.open(path,"rb") as wf:
+            channels=wf.getnchannels(); rate=wf.getframerate() or 1; width=wf.getsampwidth(); total=wf.getnframes()
+            raw=wf.readframes(total)
+        if width != 2 or not raw:
+            return []
+        import array
+        vals=array.array('h'); vals.frombytes(raw)
+        if channels>1:
+            vals=array.array('h',[sum(vals[i:i+channels])//channels for i in range(0,len(vals),channels)])
+        step=max(1,len(vals)//samples)
+        curve=[]
+        for i in range(0,len(vals),step):
+            chunk=vals[i:i+step]
+            if not chunk: break
+            rms=math.sqrt(sum(v*v for v in chunk)/len(chunk))/32768.0
+            curve.append(max(0.0,min(1.0,rms*5.5)))
+        return curve
+    except Exception:
+        return []
+
+
+def _mouth_amount(curve, t, speaking=False):
+    if not speaking:
+        return 0.0
+    if not curve:
+        return 0.35 + 0.25*abs(math.sin(t*math.pi*11))
+    return curve[min(len(curve)-1,max(0,int(t*(len(curve)-1))))]
 
 
 def _draw_auto_puppet(base, puppet, skel, t, speaking=False, outfit=None):
@@ -2413,7 +2497,9 @@ def _project_3d(x, y, z, w, h, camera_z=7.0):
 
 
 def _draw_3d_line(d, a, b, w, h, fill, width=10):
-    pa = _project_3d(*a, w, h); pb = _project_3d(*b, w, h)
+    # P() allaqachon 3D nuqtani 2D pikselga proyeksiya qiladi.
+    # Shu sababli bu yerda qayta _project_3d chaqirilmaydi.
+    pa = (float(a[0]), float(a[1])); pb = (float(b[0]), float(b[1]))
     d.line([pa, pb], fill=fill, width=max(1, int(width)), joint="curve")
 
 
@@ -2421,7 +2507,7 @@ def _shade(rgb, factor):
     return tuple(max(0, min(255, int(c * factor))) for c in rgb)
 
 
-def _draw_3d_mannequin(base, name, t, x_offset=0.0, depth=0.0, speaking=False, outfit=None):
+def _draw_3d_mannequin(base, name, t, x_offset=0.0, depth=0.0, speaking=False, outfit=None, mouth_open=None, action="idle"):
     """Integrated lightweight 3D human: volumetric body, perspective, lighting, shadow and animation."""
     d = ImageDraw.Draw(base, "RGBA")
     seed = hashlib.sha256(str(name).encode("utf-8")).digest()
@@ -2429,6 +2515,12 @@ def _draw_3d_mannequin(base, name, t, x_offset=0.0, depth=0.0, speaking=False, o
     sway = 0.10 * phase
     arm = 0.24 * math.sin(t * math.pi * 2 + 0.7)
     leg = 0.18 * math.sin(t * math.pi * 2 + 3.0)
+    if action == "walk":
+        arm *= 1.65; leg *= 1.75
+    elif action == "run":
+        arm *= 2.3; leg *= 2.6
+    elif action == "nervous":
+        sway *= 1.8; arm *= 1.25
     x = x_offset
     z = depth
     skin0 = _hash_color(name, 1)
@@ -2493,9 +2585,14 @@ def _draw_3d_mannequin(base, name, t, x_offset=0.0, depth=0.0, speaking=False, o
     # Ears
     d.ellipse((hx-hr-7,hy-10,hx-hr+8,hy+16), fill=_shade(skin0,.90)+(255,))
     d.ellipse((hx+hr-8,hy-10,hx+hr+7,hy+16), fill=_shade(skin0,.90)+(255,))
-    # Hair cap
+    # Hair cap + individual moving strands.
     d.pieslice((hx-hr-2,hy-hr-4,hx+hr+2,hy+hr//2), 180, 360, fill=hair0+(255,))
     d.polygon([(hx-hr+3,hy-hr//3),(hx-hr//3,hy-hr-2),(hx+hr//4,hy-hr//2),(hx+hr-4,hy-hr//5)], fill=_shade(hair0,.78)+(255,))
+    wind=math.sin(t*math.pi*2.0 + seed[1]/255.0*math.pi*2.0)*max(1,hr//8)
+    for strand in range(7):
+        sx=hx-hr+int((strand+1)*2*hr/8); sy=hy-hr//2-int((strand%3)*hr/12)
+        ex=sx+int(wind*(0.45+strand/10)); ey=sy+hr//3+int(math.sin(t*math.pi*2+strand)*hr/12)
+        d.line((sx,sy,ex,ey),fill=_shade(hair0,.55)+(170,),width=max(1,hr//18))
     # Eyes and brows
     eye_y = hy-2
     for ex in (hx-int(hr*.34), hx+int(hr*.34)):
@@ -2506,10 +2603,12 @@ def _draw_3d_mannequin(base, name, t, x_offset=0.0, depth=0.0, speaking=False, o
     d.line((hx,hy+2,hx-hr//12,hy+hr//5,hx+hr//10,hy+hr//5), fill=_shade(skin0,.70)+(190,), width=max(1,hr//18))
     d.ellipse((hx-hr//2,hy+hr//6,hx-hr//6,hy+hr//2), fill=(210,90,95,22))
     d.ellipse((hx+hr//6,hy+hr//6,hx+hr//2,hy+hr//2), fill=(210,90,95,18))
-    # Mouth animation for speech.
-    if speaking:
-        d.ellipse((hx-hr//4,hy+hr//3,hx+hr//4,hy+hr//2), fill=(55,18,20,230))
-        d.arc((hx-hr//5,hy+hr//4,hx+hr//5,hy+hr//2), 10, 170, fill=(235,170,170,210), width=max(1,hr//16))
+    # Mouth animation: amplitudaga bog'langan, shuning uchun dialogda og'iz ovoz ritmiga ochilib-yopiladi.
+    amount = float(mouth_open if mouth_open is not None else (0.45 if speaking else 0.0))
+    if amount > 0.08:
+        mh=max(2,int(hr*(0.05+0.16*amount)))
+        d.ellipse((hx-hr//4,hy+hr//3-mh,hx+hr//4,hy+hr//3+mh), fill=(55,18,20,235))
+        d.arc((hx-hr//5,hy+hr//4,hx+hr//5,hy+hr//2+mh), 10, 170, fill=(235,170,170,210), width=max(1,hr//16))
     else:
         d.arc((hx-hr//4,hy+hr//5,hx+hr//4,hy+hr//2), 5, 175, fill=(100,45,50,210), width=max(1,hr//18))
     # Eye/head highlight for cinematic light.
@@ -2643,75 +2742,107 @@ def _concat_audio_files(paths, out):
     return ok
 
 
+def _scene_action(sentence):
+    low=str(sentence or "").lower()
+    if any(x in low for x in ("yugur", "yugurdi", "yugurmoqda", "qoch", "qochdi")):
+        return "run"
+    if any(x in low for x in ("yur", "yurdi", "yurmoqda", "ketdi", "kelmoqda", "yaqinlash")):
+        return "walk"
+    if any(x in low for x in ("hayajon", "qo'rq", "qo‘rq", "asab", "vahima")):
+        return "nervous"
+    return "idle"
+
+
 def _render_scene(state, scene_index, total_scenes, job_dir, characters, puppets, dialogue_map):
     scene_dir=os.path.join(job_dir,f"scene_{scene_index:04d}")
     os.makedirs(scene_dir,exist_ok=True)
-    sentence=state["scene_texts"][scene_index-1]
+    sentence=state.get("scene_texts",[""])[scene_index-1]
+    active=_scene_active_characters(sentence,characters,dialogue_map,scene_index)
     speaker=None
-    # Dialogue belongs to exact speaker; if scene sentence contains speaker name, use it.
     low=sentence.lower()
-    for name in characters:
+    for name in active:
         if name.lower() in low:
             speaker=name; break
     if speaker is None and dialogue_map:
-        speaker=dialogue_map[(scene_index-1)%len(dialogue_map)]["speaker"]
-    audio_paths=[]
+        for d in dialogue_map:
+            if d.get("speaker") in active and d.get("text","").lower() in low:
+                speaker=d.get("speaker"); break
+    audio=None
     if speaker and dialogue_map:
         for d in dialogue_map:
-            if d["speaker"]==speaker and d["text"] in sentence:
+            if d.get("speaker")==speaker and d.get("text"):
                 wp=os.path.join(scene_dir,"voice.wav")
-                if _synthesize_dialogue(d["text"],speaker,wp): audio_paths.append(wp)
+                if _synthesize_dialogue(d["text"],speaker,wp):
+                    audio=os.path.join(scene_dir,"audio.wav")
+                    if not _concat_audio_files([wp],audio): audio=None
                 break
-    audio=None
-    if audio_paths:
-        audio=os.path.join(scene_dir,"audio.wav")
-        _concat_audio_files(audio_paths,audio)
+    energy=_audio_energy_curve(audio) if audio else []
     frame_count=max(1,int(round(MOVIE_SCENE_SECONDS*MOVIE_FPS)))
+    action=_scene_action(sentence)
     for fi in range(frame_count):
         t=fi/max(1,frame_count-1)
         frame=_make_background(state,scene_index,(MOVIE_WIDTH,MOVIE_HEIGHT))
+        # Kino kamerasi: umumiy plan -> o'rta/yaqin plan hissi va yengil handheld drift.
         d=ImageDraw.Draw(frame,"RGBA")
-        d.rectangle((0,0,MOVIE_WIDTH,90),fill=(0,0,0,75))
-        # Scene title is subtle and optional; no technical status.
-        d.text((35,28),f"{state.get('title','Kino')}  •  {scene_index}",font=_safe_font(26,True),fill=(255,255,255,220))
-        for i,name in enumerate(characters):
-            puppet=puppets.get(name)
-            if not puppet: continue
-            skel=_make_skeleton(MOVIE_WIDTH,MOVIE_HEIGHT)
-            # Natural entrance / staging: alternate sides, then converge.
-            offset=(-170+i*170) if len(characters)>1 else 0
-            local=frame.copy()
-            if puppet["kind"]=="auto":
-                # 3D procedural mannequin: telefon/Renderga og'ir 3D model paketlari kerak emas.
-                if MOVIE_3D_ENABLED:
-                    _draw_3d_mannequin(local,name,t,x_offset=offset/190.0,depth=(i%MOVIE_3D_DEPTH)*0.16,speaking=(speaker==name and int(t*8)%2==0),outfit=_outfit_for(name,scene_index))
-                else:
-                    skel={k:(v[0]+offset,v[1]) for k,v in skel.items()}
-                    _draw_auto_puppet(local,puppet,skel,t,speaking=(speaker==name and int(t*8)%2==0),outfit=_outfit_for(name,scene_index))
+        d.rectangle((0,0,MOVIE_WIDTH,78),fill=(0,0,0,55))
+        d.text((30,24),f"{state.get('title','Kino')}  •  {scene_index}",font=_safe_font(24,True),fill=(255,255,255,205))
+        count=max(1,len(active))
+        for i,name in enumerate(active):
+            puppet=puppets.get(name) or _make_auto_puppet(name)
+            # Har sahnada boshqa kompozitsiya: qatorga tizish yo'q.
+            if count==1:
+                base_x=0.0
+                depth=0.10
+            elif count==2:
+                base_x=-0.72 if i==0 else 0.68
+                depth=0.05 if i==0 else 0.28
             else:
+                base_x=(-0.75,0.72)[i%2]
+                depth=0.10+0.18*(i//2)
+            if action in ("walk","run"):
+                base_x += math.sin(t*math.pi*2 + i*1.7)*0.34
+            elif action=="nervous":
+                base_x += math.sin(t*math.pi*4 + i)*0.08
+            # Gapni aytayotgan odam biroz oldinga chiqadi.
+            if speaker==name:
+                depth -= 0.10
+            local=frame.copy()
+            outfit=_outfit_for(name,scene_index,sentence)
+            mouth=_mouth_amount(energy,t,speaking=(speaker==name))
+            if puppet.get("kind")=="auto" and MOVIE_3D_ENABLED:
+                _draw_3d_mannequin(local,name,t,x_offset=base_x,depth=depth,speaking=(speaker==name),outfit=outfit,mouth_open=mouth,action=action)
+            elif puppet.get("kind")=="auto":
+                skel=_make_skeleton(MOVIE_WIDTH,MOVIE_HEIGHT)
+                offset=int(base_x*190)
                 skel={k:(v[0]+offset,v[1]) for k,v in skel.items()}
-                _draw_photo_puppet(local,puppet,skel,t,speaking=(speaker==name and int(t*8)%2==0),outfit=_outfit_for(name,scene_index))
+                _draw_auto_puppet(local,puppet,skel,t,speaking=(speaker==name and mouth>0.08),outfit=outfit)
+            else:
+                skel=_make_skeleton(MOVIE_WIDTH,MOVIE_HEIGHT)
+                offset=int(base_x*190)
+                skel={k:(v[0]+offset,v[1]) for k,v in skel.items()}
+                _draw_photo_puppet(local,puppet,skel,t,speaking=(speaker==name and mouth>0.08),outfit=outfit)
             frame=Image.alpha_composite(frame,local)
-        # Cinematic caption derived from scenario sentence; not a technical message.
-        caption=sentence[:120]
+        # Faqat sahna mazmuni; texnik progress user kadriga chiqarilmaydi.
+        caption=re.sub(r"\s+"," ",sentence).strip()[:150]
         if caption:
             d=ImageDraw.Draw(frame,"RGBA")
-            d.rounded_rectangle((35,MOVIE_HEIGHT-105,MOVIE_WIDTH-35,MOVIE_HEIGHT-35),radius=18,fill=(0,0,0,90))
-            d.text((55,MOVIE_HEIGHT-85),caption,font=_safe_font(22),fill=(255,255,255,235))
+            d.rounded_rectangle((28,MOVIE_HEIGHT-92,MOVIE_WIDTH-28,MOVIE_HEIGHT-24),radius=16,fill=(0,0,0,80))
+            d.text((48,MOVIE_HEIGHT-74),caption,font=_safe_font(20),fill=(255,255,255,225))
         frame=_add_camera_motion(frame,t,scene_index)
-        frame.convert("RGB").save(os.path.join(scene_dir,f"frame_{fi:05d}.jpg"),quality=88)
+        frame.convert("RGB").save(os.path.join(scene_dir,f"frame_{fi:05d}.jpg"),quality=90)
     video_path=os.path.join(job_dir,f"scene_{scene_index:04d}.mp4")
     if not shutil.which("ffmpeg"):
         raise RuntimeError("FFmpeg topilmadi")
     pattern=os.path.join(scene_dir,"frame_%05d.jpg")
     cmd=["ffmpeg","-y","-framerate",str(MOVIE_FPS),"-i",pattern]
     if audio and os.path.exists(audio):
-        cmd += ["-i",audio,"-c:v","libx264","-preset","ultrafast","-crf","23","-pix_fmt","yuv420p","-c:a","aac","-shortest",video_path]
+        cmd += ["-i",audio,"-c:v","libx264","-preset","ultrafast","-crf","21","-pix_fmt","yuv420p","-c:a","aac","-shortest",video_path]
     else:
-        cmd += ["-c:v","libx264","-preset","ultrafast","-crf","23","-pix_fmt","yuv420p",video_path]
+        cmd += ["-c:v","libx264","-preset","ultrafast","-crf","21","-pix_fmt","yuv420p",video_path]
     p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=900)
     if p.returncode!=0 or not os.path.exists(video_path):
-        raise RuntimeError("Sahna videosini yaratib bo'lmadi")
+        err=p.stderr.decode("utf-8","ignore")[-800:]
+        raise RuntimeError(f"Sahna videosini yaratib bo'lmadi: {err}")
     shutil.rmtree(scene_dir,ignore_errors=True)
     return video_path
 
@@ -2793,17 +2924,27 @@ def receive_movie_description(message):
     state["step"]="scenario_generating"
     bot.send_message(message.chat.id,"📝 <b>Siz yozgan g'oya professional ssenariyga aylantirilmoqda...</b>\n\n🤖 AI ssenariyni tayyorlayapti.")
     def worker():
-        result=ask_ai(_scenario_prompt(text),max_retries=3)
-        current=movie_generation_state.get(uid)
-        if not current: return
-        scenario=result or text
-        current["scenario"]=scenario
-        current["characters"]=_extract_characters(scenario)
-        current["dialogues"]=_extract_dialogues(scenario,current["characters"])
-        current["title"]=_make_title(scenario)
-        current["step"]="scenario_ready"
-        send_ai_text(message.chat.id,"🎬 <b>Tayyor ssenariy</b>",scenario)
-        _show_character_menu(message.chat.id,uid)
+        try:
+            result=ask_ai(_scenario_prompt(text),max_retries=3)
+            current=movie_generation_state.get(uid)
+            if not current: return
+            scenario=(result or "").strip()
+            if len(scenario)<20:
+                # AI javob bermasa foydalanuvchi matnini yana "tayyor ssenariy" deb ko'rsatmaymiz.
+                scenario = _build_fallback_screenplay(text)
+            current["scenario"]=scenario
+            current["characters"]=_extract_characters(scenario)
+            current["dialogues"]=_extract_dialogues(scenario,current["characters"])
+            current["title"]=_make_title(scenario)
+            current["step"]="scenario_ready"
+            send_ai_text(message.chat.id,"🎬 <b>Tayyor ssenariy</b>",scenario)
+            _show_character_menu(message.chat.id,uid)
+        except Exception as e:
+            print("❌ Ssenariy yaratish xatosi:",type(e).__name__,e,flush=True)
+            current=movie_generation_state.get(uid)
+            if current:
+                current["step"]="description"
+            bot.send_message(message.chat.id,"❌ Ssenariy yaratishda texnik xato bo'ldi. Iltimos, g'oyani qayta yuboring.")
     threading.Thread(target=worker,daemon=True).start()
 
 
@@ -2818,16 +2959,31 @@ def receive_video_duration(message):
     state["duration_minutes"]=minutes; state["duration"]=(message.text or "").strip(); state["step"]="duration_generating"
     bot.send_message(message.chat.id,f"⏱ <b>{minutes} daqiqalik ssenariy tayyorlanmoqda...</b>\n\n🤖 AI sahnalar va dialoglarni shu davomiylikka moslamoqda.")
     def worker():
-        result=ask_ai(_duration_prompt(state,state["duration"]),max_retries=3)
-        current=movie_generation_state.get(uid)
-        if not current: return
-        if result: current["scenario"]=result
-        current["characters"]=_extract_characters(current.get("scenario",""))
-        current["dialogues"]=_extract_dialogues(current.get("scenario",""),current["characters"])
-        current["title"]=_make_title(current.get("scenario",""))
-        current["step"]="video_ready"
-        if result: send_ai_text(message.chat.id,"✅ <b>Ssenariy davomiylikka moslandi</b>",result)
-        bot.send_message(message.chat.id,f"🎬 <b>{minutes} daqiqalik ssenariy tayyor.</b>\n\nEndi kinoni yaratishingiz mumkin:",reply_markup=_movie_buttons(uid,"create"))
+        try:
+            original=state.get("scenario","")
+            result=ask_ai(_duration_prompt(state,state["duration"]),max_retries=3)
+            current=movie_generation_state.get(uid)
+            if not current: return
+            if result and len(str(result).strip())>=20:
+                current["scenario"]=str(result).strip()
+            elif original:
+                current["scenario"]=original
+            else:
+                current["scenario"]=_build_fallback_screenplay(state.get("raw_description", ""))
+            current["characters"]=_extract_characters(current.get("scenario",""))
+            current["dialogues"]=_extract_dialogues(current.get("scenario",""),current["characters"])
+            current["title"]=_make_title(current.get("scenario",""))
+            current["step"]="video_ready"
+            # Davomiylikdan keyin ssenariy ALBATTA foydalanuvchiga qayta ko'rsatiladi.
+            send_ai_text(message.chat.id,"🎬 <b>Tayyor ssenariy</b>",current.get("scenario",""))
+            bot.send_message(message.chat.id,f"⏱ <b>Davomiylik: {minutes} daqiqa</b>\n\n✅ Ssenariy shu davomiylikka moslandi.\n\nEndi kinoni yaratishingiz mumkin:",reply_markup=_movie_buttons(uid,"create"))
+        except Exception as e:
+            print("❌ Davomiylikka moslash xatosi:",type(e).__name__,e,flush=True)
+            current=movie_generation_state.get(uid)
+            if current:
+                current["step"]="video_ready"
+                send_ai_text(message.chat.id,"🎬 <b>Tayyor ssenariy</b>",current.get("scenario") or _build_fallback_screenplay(current.get("raw_description","")))
+                bot.send_message(message.chat.id,f"⏱ <b>Davomiylik: {minutes} daqiqa</b>\n\n⚠️ Ssenariy saqlab qolindi. Endi kinoni yaratishingiz mumkin:",reply_markup=_movie_buttons(uid,"create"))
     threading.Thread(target=worker,daemon=True).start()
 
 
