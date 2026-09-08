@@ -34,8 +34,8 @@ RUN git clone --depth 1 https://github.com/shubham-goel/4D-Humans.git /opt/4D-Hu
 
 COPY . /app
 
-RUN python -m py_compile /app/uzb_ai_bot3.py
+RUN python -m py_compile /app/uzb_ai_bot4_ltx25.py
 
 EXPOSE 10000
 
-CMD ["python", "uzb_ai_bot3.py"]
+CMD ["python", "uzb_ai_bot4_ltx25.py"]
